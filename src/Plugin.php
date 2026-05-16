@@ -1,6 +1,6 @@
 <?php
 
-namespace Tools\ComposerWorkspaces;
+namespace Azteck\ComposerWorkspaces;
 
 use Composer\Composer;
 use Composer\EventDispatcher\EventSubscriberInterface;
