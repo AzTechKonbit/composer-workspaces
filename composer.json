@@ -1,0 +1,16 @@
+{
+    "name": "azteck/composer-workspaces",
+    "description": "Gestionnaire de workspaces Composer pour applications modulaires et monorepos PHP",
+    "type": "composer-plugin",
+    "extra": {
+        "class": "Azteck\\ComposerWorkspaces\\Plugin"
+    },
+    "autoload": {
+        "psr-4": {
+            "Azteck\\ComposerWorkspaces\\": "src/"
+        }
+    },
+    "require": {
+        "composer-plugin-api": "^2.0"
+    }
+}
