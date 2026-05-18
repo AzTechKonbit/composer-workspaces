@@ -15,7 +15,8 @@ class Plugin implements PluginInterface, EventSubscriberInterface
     private Composer    $composer;
     private IOInterface $io;
     private string      $rootDir;
-    private string      $modulesDir;
+    /** @var string[] */
+    private array $searchPaths = [];
 
     // -------------------------------------------------------------------------
     // PluginInterface
@@ -23,10 +24,10 @@ class Plugin implements PluginInterface, EventSubscriberInterface
 
     public function activate(Composer $composer, IOInterface $io): void
     {
-        $this->composer   = $composer;
-        $this->io         = $io;
-        $this->rootDir    = realpath(dirname($composer->getConfig()->get('vendor-dir')));
-        $this->modulesDir = $this->rootDir . '/Modules';
+        $this->composer  = $composer;
+        $this->io        = $io;
+        $this->rootDir   = realpath(dirname($composer->getConfig()->get('vendor-dir')));
+        $this->searchPaths = $this->resolveSearchPaths();
     }
 
     public function deactivate(Composer $composer, IOInterface $io): void {}
@@ -47,7 +48,7 @@ class Plugin implements PluginInterface, EventSubscriberInterface
 
     public function onPreAutoloadDump(Event $event): void
     {
-        $this->io->write('<info>[Workspaces] Injection des PSR-4 des modules...</info>');
+        $this->io->write('<info>[Workspaces] Injection des PSR-4...</info>');
         $this->injectAutoloads();
     }
 
@@ -62,6 +63,43 @@ class Plugin implements PluginInterface, EventSubscriberInterface
     }
 
     // -------------------------------------------------------------------------
+    // Résolution des chemins depuis extra.workspaces.paths
+    // -------------------------------------------------------------------------
+
+    /**
+     * Lit extra.workspaces.paths dans le composer.json racine.
+     * Retourne uniquement les chemins qui existent réellement sur le disque.
+     * Fallback sur ["Modules"] si rien n'est configuré.
+     *
+     * @return string[]
+     */
+    private function resolveSearchPaths(): array
+    {
+        $extra = $this->composer->getPackage()->getExtra();
+        $configured = $extra['workspaces']['paths'] ?? ['Modules'];
+
+        $resolved = [];
+        foreach ((array) $configured as $path) {
+            // Support chemin absolu ou relatif à la racine du projet
+            $absolute = str_starts_with($path, '/')
+                ? $path
+                : $this->rootDir . '/' . trim($path, '/');
+
+            if (!is_dir($absolute)) {
+                $this->io->write(sprintf(
+                    '  <comment>[Workspaces] Chemin ignoré (introuvable) :</comment> %s',
+                    $path
+                ));
+                continue;
+            }
+
+            $resolved[] = realpath($absolute);
+        }
+
+        return $resolved;
+    }
+
+    // -------------------------------------------------------------------------
     // PSR-4 injection
     // -------------------------------------------------------------------------
 
@@ -71,27 +109,30 @@ class Plugin implements PluginInterface, EventSubscriberInterface
         $autoload    = $package->getAutoload();
         $autoloadDev = $package->getDevAutoload();
 
-        foreach ($this->findModules() as $modulePath) {
+        foreach ($this->findWorkspaces() as $modulePath) {
             $config = $this->readJson($modulePath . '/composer.json');
             if (!$config) {
                 continue;
             }
 
+            $name = basename($modulePath);
+
             foreach ($config['autoload']['psr-4'] ?? [] as $namespace => $path) {
                 $rel = $this->relative($this->rootDir, $modulePath . '/' . trim($path, '/'));
                 $autoload['psr-4'][$namespace] = $rel . '/';
-                $this->io->write("  <comment>PSR-4</comment> {$namespace} → {$rel}");
+                $this->io->write("  <comment>PSR-4</comment>     [{$name}] {$namespace} → {$rel}");
             }
 
             foreach ($config['autoload']['classmap'] ?? [] as $path) {
                 $rel = $this->relative($this->rootDir, $modulePath . '/' . trim($path, '/'));
                 $autoload['classmap'][] = $rel . '/';
+                $this->io->write("  <comment>classmap</comment>  [{$name}] → {$rel}");
             }
 
             foreach ($config['autoload-dev']['psr-4'] ?? [] as $namespace => $path) {
                 $rel = $this->relative($this->rootDir, $modulePath . '/' . trim($path, '/'));
                 $autoloadDev['psr-4'][$namespace] = $rel . '/';
-                $this->io->write("  <comment>PSR-4 dev</comment> {$namespace} → {$rel}");
+                $this->io->write("  <comment>PSR-4 dev</comment> [{$name}] {$namespace} → {$rel}");
             }
         }
 
@@ -100,12 +141,12 @@ class Plugin implements PluginInterface, EventSubscriberInterface
     }
 
     // -------------------------------------------------------------------------
-    // Installation des modules
+    // Installation des dépendances des workspaces
     // -------------------------------------------------------------------------
 
     private function installModules(): void
     {
-        foreach ($this->findModules() as $modulePath) {
+        foreach ($this->findWorkspaces() as $modulePath) {
             $config = $this->readJson($modulePath . '/composer.json');
             if (empty($config['require'])) {
                 continue;
@@ -130,12 +171,20 @@ class Plugin implements PluginInterface, EventSubscriberInterface
 
         $this->io->write(sprintf('<info>[install]</info> %s...', basename($path)));
 
-        $bin = $this->composerBin();
-        $cmd = sprintf('%s install --no-interaction --prefer-dist --working-dir=%s 2>&1', $bin, escapeshellarg($path));
+        $cmd = sprintf(
+            '%s install --no-interaction --prefer-dist --working-dir=%s 2>&1',
+            $this->composerBin(),
+            escapeshellarg($path)
+        );
+
         exec($cmd, $output, $code);
 
         if ($code !== 0) {
-            $this->io->writeError(sprintf('<error>Erreur %s</error>: %s', basename($path), implode("\n", $output)));
+            $this->io->writeError(sprintf(
+                '<error>Erreur %s</error>: %s',
+                basename($path),
+                implode("\n", $output)
+            ));
         } else {
             $this->io->write(sprintf('  <info>✓ %s</info>', basename($path)));
         }
@@ -145,20 +194,30 @@ class Plugin implements PluginInterface, EventSubscriberInterface
     // Helpers
     // -------------------------------------------------------------------------
 
-    private function findModules(): array
+    /**
+     * Retourne tous les sous-dossiers des searchPaths qui ont un composer.json
+     *
+     * @return string[]
+     */
+    private function findWorkspaces(): array
     {
-        if (!is_dir($this->modulesDir)) {
-            return [];
-        }
+        $found = [];
 
-        $modules = [];
-        foreach (new \DirectoryIterator($this->modulesDir) as $entry) {
-            if (!$entry->isDot() && $entry->isDir() && file_exists($entry->getPathname() . '/composer.json')) {
-                $modules[] = $entry->getPathname();
+        foreach ($this->searchPaths as $searchPath) {
+            foreach (new \DirectoryIterator($searchPath) as $entry) {
+                if ($entry->isDot() || !$entry->isDir()) {
+                    continue;
+                }
+
+                $composerFile = $entry->getPathname() . '/composer.json';
+
+                if (file_exists($composerFile)) {
+                    $found[] = $entry->getPathname();
+                }
             }
         }
 
-        return $modules;
+        return $found;
     }
 
     private function readJson(string $path): ?array
